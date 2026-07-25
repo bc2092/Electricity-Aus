@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import io
+import ssl
+import subprocess
 from datetime import date
 from importlib.resources import path
 from pathlib import Path
@@ -15,6 +18,9 @@ USER_AGENT = (
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/124.0.0.0 Safari/537.36"
 )
+
+RBA_G1_CSV_URL = "https://www.rba.gov.au/statistics/tables/csv/g1-data.csv"
+CPI_SERIES_ID = "GCPIAG"  # RBA G1: Consumer price index; All groups
 
 
 def _parse_yyyymm(value: str) -> date:
@@ -100,7 +106,7 @@ def load_price_and_demand(
 
     df = pd.concat(frames, ignore_index=True)
     if "SETTLEMENTDATE" in df.columns:
-        df["SETTLEMENTDATE"] = pd.to_datetime(df["SETTLEMENTDATE"])
+        df["SETTLEMENTDATE"] = pd.to_datetime(df["SETTLEMENTDATE"], format="mixed")
     return df
 
 
@@ -165,26 +171,148 @@ def group_by_region(df: pd.DataFrame, by: list[str]) -> pd.DataFrame:
         .agg(
             MWh=("MWh", "sum"),
             value_dollars=("value_dollars", "sum"),
+            value_dollars_real=("value_dollars_real", "sum"),
             days=("date", "nunique"),
         )
     )
     per_region["RRP"] = per_region["value_dollars"] / per_region["MWh"]
-
+    per_region["RRP_real"] = per_region["value_dollars_real"] / per_region["MWh"]
     all_region = (
         per_region.groupby(list(by), as_index=False)
         .agg(
             MWh=("MWh", "sum"),
             value_dollars=("value_dollars", "sum"),
+            value_dollars_real=("value_dollars_real", "sum"),
             days=("days", "max"),
         )
     )
     all_region["RRP"] = all_region["value_dollars"] / all_region["MWh"]
+    all_region["RRP_real"] = all_region["value_dollars_real"] / all_region["MWh"]   
     all_region["REGION"] = "NEM"
 
     return pd.concat(
-        [per_region, all_region[keys + ["MWh", "value_dollars", "RRP", "days"]]],
+        [per_region, all_region[keys + ["MWh", "value_dollars", "RRP", "days", "value_dollars_real", "RRP_real"]]],
         ignore_index=True,
     )
+
+
+def plot_prices(df: pd.DataFrame, label_every: int = 5) -> None:
+    import matplotlib.pyplot as plt
+
+    time_col = next(
+        (c for c in ("yyyy", "yyyy_qtr", "yyyymm") if c in df.columns),
+        None,
+    )
+    if time_col is None:
+        raise ValueError("df must contain one of yyyy, yyyy_qtr, yyyymm")
+
+    def _label(v: object) -> str:
+        s = str(v)
+        if time_col == "yyyymm" and len(s) == 6 and s.isdigit():
+            return pd.Timestamp(year=int(s[:4]), month=int(s[4:]), day=1).strftime("%b %Y")
+        if time_col == "yyyy_qtr" and "_" in s:
+            yr, q = s.split("_", 1)
+            return f"{q} {yr}"
+        return s
+
+    d = df.sort_values(time_col).reset_index(drop=True)
+    positions = range(len(d))
+    region = d["REGION"].iloc[0] if "REGION" in d.columns else ""
+
+    fig, ax1 = plt.subplots(figsize=(11, 5))
+    ax1.plot(positions, d["RRP"], color="C0", marker="o", label="RRP (nominal)", zorder=3)
+    if "RRP_real" in d.columns:
+        ax1.plot(positions, d["RRP_real"], color="C3", marker="o", label="RRP (real)", zorder=3)
+
+    tick_positions = list(positions)[::label_every]
+    tick_labels = [_label(v) for v in d[time_col].iloc[::label_every]]
+    ax1.set_xticks(tick_positions)
+    ax1.set_xticklabels(tick_labels, rotation=45, ha="right")
+
+    ax1.set_xlabel(time_col)
+    ax1.set_ylabel("RRP ($/MWh)")
+    ax1.set_title(f"Electricity price & volume — {region} ({time_col})")
+    ax1.grid(True, alpha=0.3)
+
+    lines1, labels1 = ax1.get_legend_handles_labels()
+    ax1.legend(lines1, labels1, loc="upper left")
+    fig.tight_layout()
+    plt.show()
+
+
+def fetch_cpi(
+    start_yyyymm: str = "200001",
+    cache_path: str | Path = "data/cpi.csv",
+) -> pd.DataFrame:
+    # RBA G1 CSV: 9 metadata rows, then a "Series ID" header row, then
+    # quarterly data with dates in DD/MM/YYYY. Australia's CPI is quarterly;
+    # monthly rows here are forward-filled from the most recent quarterly print.
+    print(f"fetching CPI: {RBA_G1_CSV_URL}")
+    result = subprocess.run(
+        ["curl.exe", "-sSL", "--max-time", "30", RBA_G1_CSV_URL],
+        capture_output=True,
+        check=True,
+    )
+    raw = result.stdout
+    print(f"fetched CPI: {len(raw)} bytes")
+
+    cache = Path(cache_path)
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    cache.write_bytes(raw)
+    print(f"cached CPI: {cache}")
+
+    raw_df = pd.read_csv(io.BytesIO(raw), skiprows=10, header=0)
+    raw_df = raw_df.rename(columns={raw_df.columns[0]: "date"})
+
+    if CPI_SERIES_ID not in raw_df.columns:
+        raise RuntimeError(
+            f"{CPI_SERIES_ID} not in RBA G1 columns: {list(raw_df.columns)[:5]}..."
+        )
+
+    cpi_q = raw_df[["date", CPI_SERIES_ID]].rename(columns={CPI_SERIES_ID: "cpi"})
+    cpi_q["date"] = pd.to_datetime(cpi_q["date"], dayfirst=True, errors="coerce")
+    cpi_q["cpi"] = pd.to_numeric(cpi_q["cpi"], errors="coerce")
+    cpi_q = cpi_q.dropna().sort_values("date")
+    cpi_q["date"] = cpi_q["date"].dt.to_period("M").dt.to_timestamp()
+    cpi_q = cpi_q.drop_duplicates("date", keep="last").set_index("date")
+
+    start = pd.Timestamp(_parse_yyyymm(start_yyyymm))
+    # Seed one quarter earlier so the first months of `start` can ffill.
+    seed = cpi_q.index[cpi_q.index <= start].max()
+    lower = seed if pd.notna(seed) else cpi_q.index.min()
+
+    monthly_idx = pd.date_range(
+        lower,
+        pd.Timestamp.today().to_period("M").to_timestamp(),
+        freq="MS",
+    )
+    monthly = cpi_q.reindex(monthly_idx).ffill().rename_axis("date").reset_index()
+    monthly = monthly[monthly["date"] >= start].reset_index(drop=True)
+    monthly["yyyymm"] = monthly["date"].dt.strftime("%Y%m")
+    return monthly
+
+
+def add_real_values(
+    df: pd.DataFrame,
+    cpi: pd.DataFrame,
+    base_yyyymm: str | None = None,
+) -> pd.DataFrame:
+    # Real values expressed in dollars of `base_yyyymm` (defaults to the
+    # latest CPI print, i.e. "in today's dollars"). Merges CPI on yyyymm.
+    cpi_lookup = cpi[["yyyymm", "cpi"]].copy()
+    cpi_lookup["yyyymm"] = cpi_lookup["yyyymm"].astype(str)
+    base = (
+        cpi_lookup.loc[cpi_lookup["yyyymm"] == base_yyyymm, "cpi"].iloc[0]
+        if base_yyyymm is not None
+        else cpi_lookup["cpi"].iloc[-1]
+    )
+
+    df = df.copy()
+    df["yyyymm"] = df["yyyymm"].astype(str)
+    df = df.merge(cpi_lookup, on="yyyymm", how="left")
+    df["RRP_real"] = df["RRP"] * base / df["cpi"]
+    df["value_dollars_real"] = df["value_dollars"] * base / df["cpi"]
+    return df
 
 
 def save_price_and_demand(
@@ -211,8 +339,8 @@ def save_price_and_demand(
 
 
 if __name__ == "__main__":
-    date_start = "202001"
-    date_end = "202412"
+    date_start = "202607"
+    date_end = "202607"
     Use30min = True
     fetch_price_and_demand(date_start, date_end)
     df1 = load_price_and_demand(date_start, date_end)
@@ -224,9 +352,13 @@ if __name__ == "__main__":
 
     df = pd.read_csv(path, parse_dates=["SETTLEMENTDATE"])
 
+    cpi=fetch_cpi("200001")
+    df = add_real_values(df, cpi)
     yearly = group_by_region(df, by=["yyyy"])
     monthly = group_by_region(df, by=["yyyymm"])
     quarterly = group_by_region(df, by=["yyyy_qtr"])
 
+
+    plot_prices(yearly[yearly.REGION == "NEM"])
     print(df.head())
     print(df.dtypes)
