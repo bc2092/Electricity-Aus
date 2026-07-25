@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import date
+from importlib.resources import path
 from pathlib import Path
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
@@ -124,7 +125,9 @@ def add_period_length(df: pd.DataFrame) -> pd.DataFrame:
     period_start = df["SETTLEMENTDATE"] - pd.to_timedelta(df["period_len"], unit="m")
     df["date"] = period_start.dt.strftime("%Y-%m-%d")
     df["time"] = period_start.dt.strftime("%H:%M")
-
+    df['yyyy'] = df["date"].str.replace("-", "").str.slice(0, 4)
+    df['yyyymm'] = df["date"].str.replace("-", "").str.slice(0, 6)
+    df['yyyy_qtr'] = df["date"].str.replace("-", "").str.slice(0, 6).apply(lambda x: f"{x[:4]}_Q{((int(x[4:6])-1)//3)+1}")
     df["MWh"] = df["period_len"] * df["TOTALDEMAND"] / 60
     df["value_dollars"] = df["RRP"] * df["MWh"]
     return df
@@ -142,23 +145,52 @@ def to_30min(df: pd.DataFrame) -> pd.DataFrame:
     bucket = five["SETTLEMENTDATE"].dt.ceil(str(new_len)+"min")
     agg = (
         five.groupby([five["REGION"], bucket])
-        .agg(MWh=("MWh", "sum"), value_dollars=("value_dollars", "sum"))
+        .agg(MWh=("MWh", "sum"), value_dollars=("value_dollars", "sum"), yyyy=("yyyy", "first"), yyyymm=("yyyymm", "first"), yyyy_qtr=("yyyy_qtr", "first"))
         .reset_index()
     )
     agg["RRP"] = agg["value_dollars"] / agg["MWh"]
     agg["TOTALDEMAND"] = agg["MWh"] * 60 / new_len
     agg["period_len"] = new_len
-    period_start = agg["SETTLEMENTDATE"] - pd.Timedelta(minutes=30)
+    period_start = agg["SETTLEMENTDATE"] - pd.Timedelta(minutes=new_len)
     agg["date"] = period_start.dt.strftime("%Y-%m-%d")
     agg["time"] = period_start.dt.strftime("%H:%M")
 
     return pd.concat([rest, agg], ignore_index=True, sort=False)
 
 
+def group_by_region(df: pd.DataFrame, by: list[str]) -> pd.DataFrame:
+    keys = ["REGION"] + list(by)
+    per_region = (
+        df.groupby(keys, as_index=False)
+        .agg(
+            MWh=("MWh", "sum"),
+            value_dollars=("value_dollars", "sum"),
+            days=("date", "nunique"),
+        )
+    )
+    per_region["RRP"] = per_region["value_dollars"] / per_region["MWh"]
+
+    all_region = (
+        per_region.groupby(list(by), as_index=False)
+        .agg(
+            MWh=("MWh", "sum"),
+            value_dollars=("value_dollars", "sum"),
+            days=("days", "max"),
+        )
+    )
+    all_region["RRP"] = all_region["value_dollars"] / all_region["MWh"]
+    all_region["REGION"] = "NEM"
+
+    return pd.concat(
+        [per_region, all_region[keys + ["MWh", "value_dollars", "RRP", "days"]]],
+        ignore_index=True,
+    )
+
+
 def save_price_and_demand(
     df: pd.DataFrame,
     output_dir: str | Path = "data",
-    filename: str = "AEMO_5min.csv",
+    filename: str = "AEMO_30min.csv",
 ) -> Path:
     out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -167,33 +199,34 @@ def save_price_and_demand(
     if target.exists():
         existing = pd.read_csv(target, parse_dates=["SETTLEMENTDATE"])
         combined = pd.concat([existing, df], ignore_index=True)
+        combined = combined.drop_duplicates(
+            subset=["REGION", "SETTLEMENTDATE"], keep="last"
+        )
     else:
         combined = df.copy()
 
-    year_month = combined["SETTLEMENTDATE"].dt.to_period("M").astype(str)
-    combined = (
-        combined.assign(_year_month=year_month)
-        .sort_values(["_year_month", "REGION", "SETTLEMENTDATE"])
-        .drop(columns="_year_month")
-        .reset_index(drop=True)
-    )
-
-    combined.to_csv(target, index=False)
+    combined_out = combined.sort_values(["yyyymm", "REGION","SETTLEMENTDATE"]).reset_index(drop=True)
+    combined_out.to_csv(target, index=False)
     return target
 
 
 if __name__ == "__main__":
-    date_start = "202601"
-    date_end = "202602"
+    date_start = "202001"
+    date_end = "202412"
     Use30min = True
-    #fetch_price_and_demand(date_start, date_end)
+    fetch_price_and_demand(date_start, date_end)
     df1 = load_price_and_demand(date_start, date_end)
+    df1.drop(columns = ['PERIODTYPE'], inplace=True)
     df1 = add_period_length(df1)
-    if Use30min:
-        df = to_30min(df1)
+    df_raw = to_30min(df1)
+    path = save_price_and_demand(df_raw)
+    print(f"wrote: {path}")
 
+    df = pd.read_csv(path, parse_dates=["SETTLEMENTDATE"])
 
-    #path = save_price_and_demand(df)
-    #print(f"wrote: {path}")
+    yearly = group_by_region(df, by=["yyyy"])
+    monthly = group_by_region(df, by=["yyyymm"])
+    quarterly = group_by_region(df, by=["yyyy_qtr"])
+
     print(df.head())
     print(df.dtypes)
