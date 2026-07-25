@@ -1,0 +1,6 @@
+.venv/
+data/
+monthly_files/
+__pycache__/
+*.pyc
+.env
