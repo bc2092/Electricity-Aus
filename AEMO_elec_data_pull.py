@@ -357,7 +357,14 @@ if __name__ == "__main__":
     yearly = group_by_region(df, by=["yyyy"])
     monthly = group_by_region(df, by=["yyyymm"])
     quarterly = group_by_region(df, by=["yyyy_qtr"])
+    period = group_by_region(df, by=["yyyy","time"])
 
+    output_dir = Path("data_output")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    yearly.to_csv(output_dir / "yearly.csv", index=False)
+    monthly.to_csv(output_dir / "monthly.csv", index=False)
+    quarterly.to_csv(output_dir / "quarterly.csv", index=False)
+    period.to_csv(output_dir / "period.csv", index=False)
 
     plot_prices(yearly[yearly.REGION == "NEM"])
     print(df.head())
