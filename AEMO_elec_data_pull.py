@@ -196,6 +196,95 @@ def group_by_region(df: pd.DataFrame, by: list[str]) -> pd.DataFrame:
     )
 
 
+PRICE_COLUMNS = ("RRP", "RRP_real")
+
+
+def _volume(df: pd.DataFrame) -> pd.Series:
+    # Weight prices by energy, falling back to demand if MWh is absent.
+    return df["MWh"] if "MWh" in df.columns else df["TOTALDEMAND"]
+
+
+def _nem_series(df: pd.DataFrame, keys: list[str], columns: list[str]) -> pd.DataFrame:
+    # Collapse the regions onto a single NEM series, one row per settlement
+    # period: demand adds up, price is the volume-weighted average of the
+    # regional prices.
+    d = df.copy()
+    d["_mwh"] = _volume(d)
+
+    price_cols = [c for c in columns if c in PRICE_COLUMNS]
+    other_cols = [c for c in columns if c not in PRICE_COLUMNS]
+    for col in price_cols:
+        d[f"_wtd_{col}"] = d[col] * d["_mwh"]
+
+    spec = {k: (k, "first") for k in keys if k in d.columns}
+    spec["_mwh"] = ("_mwh", "sum")
+    spec.update({col: (col, "sum") for col in other_cols})
+    spec.update({f"_wtd_{col}": (f"_wtd_{col}", "sum") for col in price_cols})
+
+    nem = d.groupby("SETTLEMENTDATE", as_index=False).agg(**spec)
+    for col in price_cols:
+        nem[col] = nem[f"_wtd_{col}"] / nem["_mwh"]
+    return nem.rename(columns={"_mwh": "MWh"})
+
+
+def describe_by(
+    df: pd.DataFrame,
+    by: str | list[str],
+    columns: list[str] = ["RRP_real", "TOTALDEMAND"],
+) -> pd.DataFrame:
+    # count/mean/min/5%/25%/50%/75%/95%/max/std for each column, grouped by
+    # `by` (e.g. "yyyy" for yearly), for each REGION plus a "NEM" row built
+    # from all regions combined. Price means are volume weighted (so they are
+    # revenue / MWh); the other stats describe the unweighted distribution.
+    # Returns columns named "<column>_<stat>".
+    keys = [by] if isinstance(by, str) else list(by)
+    price_cols = [c for c in columns if c in PRICE_COLUMNS]
+
+    stats = {
+        "count": "count",
+        "mean": "mean",
+        "min": "min",
+        "5%": lambda s: s.quantile(0.05),
+        "25%": lambda s: s.quantile(0.25),
+        "50%": lambda s: s.quantile(0.50),
+        "75%": lambda s: s.quantile(0.75),
+        "95%": lambda s: s.quantile(0.95),
+        "max": "max",
+        "std": "std",
+    }
+
+    def _stats(frame: pd.DataFrame, group_keys: list[str]) -> pd.DataFrame:
+        d = frame.copy()
+        mwh = _volume(d)
+        for col in price_cols:
+            # Weight sums are per column so a missing price drops its own
+            # volume from the denominator rather than biasing the average.
+            d[f"_wtd_{col}"] = d[col] * mwh
+            d[f"_w_{col}"] = mwh.where(d[col].notna())
+
+        spec = {
+            f"{col}_{name}": (col, func)
+            for col in columns
+            for name, func in stats.items()
+        }
+        spec.update(
+            {f"_wtd_{col}": (f"_wtd_{col}", "sum") for col in price_cols}
+            | {f"_w_{col}": (f"_w_{col}", "sum") for col in price_cols}
+        )
+
+        out = d.groupby(group_keys, as_index=False).agg(**spec)
+        for col in price_cols:
+            out[f"{col}_mean"] = out[f"_wtd_{col}"] / out[f"_w_{col}"]
+        return out.drop(columns=[c for c in out.columns if c.startswith(("_wtd_", "_w_"))])
+
+    per_region = _stats(df, ["REGION"] + keys)
+    all_region = _stats(_nem_series(df, keys, columns), keys)
+    all_region["REGION"] = "NEM"
+
+    out = pd.concat([per_region, all_region[per_region.columns]], ignore_index=True)
+    return out.sort_values(keys + ["REGION"]).reset_index(drop=True)
+
+
 def plot_prices(df: pd.DataFrame, label_every: int = 5) -> None:
     import matplotlib.pyplot as plt
 
@@ -358,13 +447,16 @@ if __name__ == "__main__":
     monthly = group_by_region(df, by=["yyyymm"])
     quarterly = group_by_region(df, by=["yyyy_qtr"])
     period = group_by_region(df, by=["yyyy","time"])
-
+    yearly_stats = describe_by(df, "yyyy")
+    year_time_stats = describe_by(df, ["yyyy",'time'])
     output_dir = Path("data_output")
     output_dir.mkdir(parents=True, exist_ok=True)
     yearly.to_csv(output_dir / "yearly.csv", index=False)
     monthly.to_csv(output_dir / "monthly.csv", index=False)
     quarterly.to_csv(output_dir / "quarterly.csv", index=False)
     period.to_csv(output_dir / "period.csv", index=False)
+    yearly_stats.to_csv(output_dir / "yearly_stats.csv", index=False)
+    year_time_stats.to_csv(output_dir / "year_time_stats.csv", index=False)
 
     plot_prices(yearly[yearly.REGION == "NEM"])
     print(df.head())
