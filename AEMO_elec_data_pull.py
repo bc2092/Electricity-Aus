@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import io
+import json
+import os
 import ssl
 import subprocess
-from datetime import date
+from datetime import date, timedelta
 from importlib.resources import path
 from pathlib import Path
+from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
 
@@ -57,7 +60,11 @@ def fetch_price_and_demand(
     #out_dir.mkdir(parents=True, exist_ok=True)
 
     saved: list[Path] = []
+    #print (f"fetching price and demand data for {start_yyyymm} to {end_yyyymm}...")
+    #[print(x) for x in _iter_months(start, end)]
+
     for yyyymm in _iter_months(start, end):
+
         for region in regions:
             filename = f"PRICE_AND_DEMAND_{yyyymm}_{region}.csv"
             target = out_dir / filename
@@ -111,26 +118,32 @@ def load_price_and_demand(
 
 
 def add_period_length(df: pd.DataFrame) -> pd.DataFrame:
-    # AEMO stamps each period with its end time, so 00:00 on the 1st of a
-    # month is actually the final period of the prior month. Shift those
-    # rows back by one nanosecond so they group with the correct month.
+    # AEMO stamps every row with the END of its period, so a 00:00 stamp on the
+    # 1st closes the month before. Ignore the 00:00 stamps and the first two
+    # slots remaining in a month give its period length (30 minutes
+    # historically, 5 minutes from Oct 2021) -- every region shares those
+    # slots, hence the de-dup. That length then applies to every row belonging
+    # to the month, including the 00:00 stamp on the 1st that closes it.
     ts = df["SETTLEMENTDATE"]
-    is_month_boundary = (ts.dt.day == 1) & (ts.dt.time == pd.Timestamp("00:00").time())
-    effective_month = ts.where(~is_month_boundary, ts - pd.Timedelta(nanoseconds=1)).dt.to_period("M")
-
-    def _minutes_between_first_two(times: pd.Series) -> float:
-        unique_sorted = times.drop_duplicates().sort_values().to_numpy()
-        if len(unique_sorted) < 2:
-            return float("nan")
-        return (unique_sorted[1] - unique_sorted[0]) / pd.Timedelta(minutes=1)
-
-    df["period_len"] = effective_month.map(
-        df.groupby(effective_month)["SETTLEMENTDATE"].apply(_minutes_between_first_two)
+    is_midnight = ts.dt.time == pd.Timestamp("00:00").time()
+    closes_prior_month = is_midnight & (ts.dt.day == 1)
+    period_month = ts.dt.to_period("M").mask(
+        closes_prior_month, ts.dt.to_period("M") - 1
     )
 
-    period_start = df["SETTLEMENTDATE"] - pd.to_timedelta(df["period_len"], unit="m")
-    df["date"] = period_start.dt.strftime("%Y-%m-%d")
-    df["time"] = period_start.dt.strftime("%H:%M")
+    def _minutes_between_first_two(times: pd.Series) -> float:
+        slots = times.drop_duplicates().nsmallest(2).to_numpy()
+        if len(slots) < 2:
+            return float("nan")
+        return (slots[1] - slots[0]) / pd.Timedelta(minutes=1)
+
+    dated = ts[~is_midnight]
+    period_len = dated.groupby(dated.dt.to_period("M")).apply(_minutes_between_first_two)
+
+    df["period_len"] = period_month.map(period_len)
+    df["period_start"] = ts - pd.to_timedelta(df["period_len"], unit="m")
+    df["date"] = df["period_start"].dt.strftime("%Y-%m-%d")
+    df["time"] = df["period_start"].dt.strftime("%H:%M")
     df['yyyy'] = df["date"].str.replace("-", "").str.slice(0, 4)
     df['yyyymm'] = df["date"].str.replace("-", "").str.slice(0, 6)
     df['yyyy_qtr'] = df["date"].str.replace("-", "").str.slice(0, 6).apply(lambda x: f"{x[:4]}_Q{((int(x[4:6])-1)//3)+1}")
@@ -157,14 +170,14 @@ def to_30min(df: pd.DataFrame) -> pd.DataFrame:
     agg["RRP"] = agg["value_dollars"] / agg["MWh"]
     agg["TOTALDEMAND"] = agg["MWh"] * 60 / new_len
     agg["period_len"] = new_len
-    period_start = agg["SETTLEMENTDATE"] - pd.Timedelta(minutes=new_len)
-    agg["date"] = period_start.dt.strftime("%Y-%m-%d")
-    agg["time"] = period_start.dt.strftime("%H:%M")
+    agg["period_start"] = agg["SETTLEMENTDATE"] - pd.Timedelta(minutes=new_len)
+    agg["date"] = agg["period_start"].dt.strftime("%Y-%m-%d")
+    agg["time"] = agg["period_start"].dt.strftime("%H:%M")
 
     return pd.concat([rest, agg], ignore_index=True, sort=False)
 
 
-def group_by_region(df: pd.DataFrame, by: list[str]) -> pd.DataFrame:
+def  group_by_region(df: pd.DataFrame, by: list[str]) -> pd.DataFrame:
     keys = ["REGION"] + list(by)
     per_region = (
         df.groupby(keys, as_index=False)
@@ -193,6 +206,76 @@ def group_by_region(df: pd.DataFrame, by: list[str]) -> pd.DataFrame:
     return pd.concat(
         [per_region, all_region[keys + ["MWh", "value_dollars", "RRP", "days", "value_dollars_real", "RRP_real"]]],
         ignore_index=True,
+    )
+
+
+def rolling_by_region(
+    df: pd.DataFrame,
+    months: tuple[int, ...] = (1, 3, 6, 12),
+    end: pd.Timestamp | str | None = None,
+    years: int | None = None,
+) -> pd.DataFrame:
+    # Trailing 1/3/12 month averages, anchored on the most recent settlement in
+    # the data (or on `end`) and then on that same date in each earlier year --
+    # so an Aug 2026 file yields the 1/3/12 months to Aug 2026, to Aug 2025, to
+    # Aug 2024 and so on. Anchors go back as far as the data supports unless
+    # `years` caps them. Each window is (date - N months, date], so windows
+    # nest within an anchor rather than tile.
+    # The last date in a month is midnight on the 1st of the next month, the end of the last period.
+    # Same shape as group_by_region's yearly output, with `date` (the window
+    # end) in place of `yyyy` plus a `window` column holding the window length
+    # in months. Aggregation is identical: volume weighted prices, nominal and
+    # real, and a "NEM" row alongside the regions. A window is skipped rather
+    # than reported short when it would reach back past the start of the data.
+    end_ts = pd.Timestamp(end) if end is not None else df["SETTLEMENTDATE"].max()
+    first_ts = df["SETTLEMENTDATE"].min()
+
+    frames: list[pd.DataFrame] = []
+    step = 0
+    while years is None or step < years:
+        anchor = end_ts - pd.DateOffset(years=step)
+        if anchor <= first_ts:
+            break
+        step += 1
+
+        for n in months:
+            start_ts = anchor - pd.DateOffset(months=n)
+            if start_ts < first_ts:
+                continue
+            window = df[
+                (df["SETTLEMENTDATE"] > start_ts) & (df["SETTLEMENTDATE"] <= anchor)
+            ].copy()
+            if window.empty:
+                continue
+            # Named window_end here because df already carries a per-row `date`
+            # that group_by_region counts for `days`; renamed on the way out.
+            window["window_end"] = anchor
+            window["window"] = n
+            out = group_by_region(window, by=["window_end", "window"])
+            out["window_start"] = start_ts
+            frames.append(out)
+
+    if not frames:
+        return pd.DataFrame()
+
+    out = pd.concat(frames, ignore_index=True).rename(columns={"window_end": "date"})
+    return (
+        out[
+            [
+                "REGION",
+                "date",
+                "window",
+                "MWh",
+                "value_dollars",
+                "RRP",
+                "days",
+                "value_dollars_real",
+                "RRP_real",
+                "window_start",
+            ]
+        ]
+        .sort_values(["window", "date", "REGION"], ascending=[True, False, True])
+        .reset_index(drop=True)
     )
 
 
@@ -381,6 +464,267 @@ def fetch_cpi(
     return monthly
 
 
+OE_BASE_URL = "https://api.openelectricity.org.au/v4"
+OE_PLAN_WINDOW_DAYS = 730
+OE_API_KEY_ENV = "OPENELECTRICITY_API_KEY"
+OE_ENV_FILE = Path(__file__).with_name(".env")
+
+
+def _oe_api_key(api_key: str | None = None) -> str:
+    # Never hard code the key here -- this file is committed. It comes from the
+    # argument, the environment, or a local .env that git ignores.
+    key = api_key or os.environ.get(OE_API_KEY_ENV) or _read_env_file().get(
+        OE_API_KEY_ENV
+    )
+    if not key:
+        raise RuntimeError(
+            f"No OpenElectricity API key. Set ${OE_API_KEY_ENV}, put "
+            f"{OE_API_KEY_ENV}=... in {OE_ENV_FILE}, or pass api_key=."
+        )
+    return key
+
+
+def _read_env_file(path: str | Path = None) -> dict[str, str]:
+    # Minimal KEY=value reader so the key can live in an untracked .env
+    # without taking a dependency on python-dotenv.
+    env_path = Path(path or OE_ENV_FILE)
+    if not env_path.exists():
+        return {}
+    values: dict[str, str] = {}
+    for line in env_path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        name, _, value = line.partition("=")
+        values[name.strip()] = value.strip().strip("\"'")
+    return values
+
+
+def oe_earliest_yyyymm(
+    window_days: int = OE_PLAN_WINDOW_DAYS, today: date | None = None
+) -> str:
+    # Earliest COMPLETE month the plan will serve. The API refuses any start
+    # before today - window_days; a month straddling that cutoff comes back
+    # truncated rather than refused, so unless the cutoff lands exactly on the
+    # 1st, the first usable month is the one after it. This moves forward each
+    # day, so it is computed at run time rather than hard coded.
+    cutoff = (today or date.today()) - timedelta(days=window_days)
+    first_of_cutoff_month = cutoff.replace(day=1)
+    if cutoff == first_of_cutoff_month:
+        return f"{cutoff:%Y%m}"
+    return f"{_add_months(first_of_cutoff_month, 1):%Y%m}"
+
+
+def oe_clamp_start(start_yyyymm: str, **kwargs) -> str:
+    # The later of the requested start and the earliest month the plan serves,
+    # so a long AEMO range does not send the API a request it will reject.
+    earliest = oe_earliest_yyyymm(**kwargs)
+    if start_yyyymm < earliest:
+        print(
+            f"generation start clamped to plan window: "
+            f"{start_yyyymm} -> {earliest}"
+        )
+        return earliest
+    return start_yyyymm
+
+
+def fetch_generation_by_fueltech(
+    start_yyyymm: str,
+    end_yyyymm: str,
+    by_region: bool = False,
+    grouping: str = "fueltech",
+    api_key: str | None = None,
+    cache_dir: str | Path = "data/openelectricity",
+    overwrite: bool = False,
+) -> pd.DataFrame:
+    # Monthly NEM energy (MWh) by fuel technology from the OpenElectricity API
+    # (the former OpenNEM). The community plan bills per call, so each month is
+    # cached to its own JSON file and only the months missing from the cache
+    # are fetched -- a later request for an overlapping range reuses whatever
+    # is already on disk. overwrite=True refetches the whole range.
+    #
+    # `grouping` is "fueltech" (coal_black, gas_ccgt, wind, solar_utility,
+    # solar_rooftop, battery_charging, ...) or the coarser "fueltech_group"
+    # (coal, gas, wind, solar, ...). by_region=True splits by NEM region
+    # instead of returning the whole-NEM total.
+    #
+    # Loads (battery_charging, pumps) come back as positive magnitudes, and
+    # the "battery" fueltech is the net of charging and discharging (negative
+    # while storage is a net load), so summing every fueltech double counts
+    # storage -- filter to the series you want before totalling.
+    start, end = _parse_yyyymm(start_yyyymm), _parse_yyyymm(end_yyyymm)
+    if start > end:
+        raise ValueError("start_yyyymm must be <= end_yyyymm")
+
+    primary = "network_region" if by_region else "network"
+    cache_dir = Path(cache_dir)
+    months = [_parse_yyyymm(m) for m in _iter_months(start, end)]
+
+    frames: list[pd.DataFrame] = []
+    wanted: list[date] = []
+    for month in months:
+        cached = None if overwrite else _read_month_cache(
+            cache_dir, primary, grouping, month
+        )
+        if cached is None:
+            wanted.append(month)
+        else:
+            frames.append(cached)
+
+    if wanted:
+        # The API caps a 1M query at 732 days, so fetch the missing months in
+        # runs of at most 24. A run spans from its first to its last missing
+        # month, which may pull a few cached months back down with it -- still
+        # cheaper than a call per month, since the cost is per call.
+        for run in _runs_within_span(wanted, months_span=24):
+            payload = _fetch_oe_window(
+                run[0], run[-1], primary, grouping, api_key
+            )
+            fetched = _tidy_oe_network_data(payload, grouping)
+            if fetched.empty:
+                continue
+            for yyyymm, rows in fetched.groupby("yyyymm", sort=True):
+                _write_month_cache(cache_dir, primary, grouping, yyyymm, rows)
+                if _parse_yyyymm(yyyymm) in wanted:
+                    frames.append(rows)
+
+    frames = [f for f in frames if not f.empty]
+    if not frames:
+        return pd.DataFrame()
+
+    out = pd.concat(frames, ignore_index=True)
+    return (
+        out.drop_duplicates(["yyyymm", "REGION", grouping])
+        .sort_values(["yyyymm", "REGION", grouping])
+        .reset_index(drop=True)
+    )
+
+
+def _runs_within_span(months: list[date], months_span: int = 24):
+    # Group the missing months into runs whose first-to-last span fits the
+    # API's 1M window. Counting months is not enough: two missing months
+    # either side of a cached gap can still span more than the limit.
+    run: list[date] = []
+    for month in months:
+        if run and month >= _add_months(run[0], months_span):
+            yield run
+            run = []
+        run.append(month)
+    if run:
+        yield run
+
+
+def _add_months(d: date, months: int) -> date:
+    total = d.year * 12 + (d.month - 1) + months
+    return date(total // 12, total % 12 + 1, 1)
+
+
+def _month_cache_path(
+    cache_dir: Path, primary: str, grouping: str, yyyymm: str
+) -> Path:
+    return cache_dir / f"NEM_energy_1M_{primary}_{grouping}_{yyyymm}.json"
+
+
+def _read_month_cache(
+    cache_dir: Path, primary: str, grouping: str, month: date
+) -> pd.DataFrame | None:
+    path = _month_cache_path(cache_dir, primary, grouping, f"{month:%Y%m}")
+    if not path.exists():
+        return None
+    print(f"skip (exists): {path.name}")
+    df = pd.DataFrame(json.loads(path.read_text(encoding="utf-8")))
+    if df.empty:
+        return df
+    df["date"] = pd.to_datetime(df["date"])
+    return df
+
+
+def _write_month_cache(
+    cache_dir: Path, primary: str, grouping: str, yyyymm: str, rows: pd.DataFrame
+) -> None:
+    # The current month is still filling, so cache only months that have
+    # closed -- otherwise a partial month would be pinned on disk for good.
+    if yyyymm >= date.today().strftime("%Y%m"):
+        print(f"not cached (month incomplete): {yyyymm}")
+        return
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    path = _month_cache_path(cache_dir, primary, grouping, yyyymm)
+    out = rows.copy()
+    out["date"] = out["date"].dt.strftime("%Y-%m-%dT%H:%M:%S")
+    path.write_text(out.to_json(orient="records"), encoding="utf-8")
+    print(f"cached generation: {path}")
+
+
+def _fetch_oe_window(
+    start: date,
+    end: date,
+    primary: str,
+    grouping: str,
+    api_key: str | None,
+) -> dict:
+    # Buckets are stamped with their start and date_end excludes the bucket
+    # sitting on it, so ask up to the 1st of the month after `end` to get
+    # `end` itself and nothing further.
+    params = {
+        "metrics": "energy",
+        "interval": "1M",
+        "primary_grouping": primary,
+        "secondary_grouping": grouping,
+        "date_start": f"{start:%Y-%m-01}T00:00:00",
+        "date_end": f"{_add_months(end, 1):%Y-%m-01}T00:00:00",
+    }
+    url = f"{OE_BASE_URL}/data/network/NEM?" + urlencode(params)
+
+    print(f"fetching generation: {start:%Y%m}-{end:%Y%m} ({primary}/{grouping})")
+    result = subprocess.run(
+        [
+            "curl.exe", "-sSL", "--max-time", "60",
+            "-H", f"Authorization: Bearer {_oe_api_key(api_key)}",
+            url,
+        ],
+        capture_output=True,
+        check=True,
+    )
+    payload = json.loads(result.stdout)
+    if not payload.get("success"):
+        raise RuntimeError(f"OpenElectricity error: {payload}")
+    return payload
+
+
+def _tidy_oe_network_data(payload: dict, grouping: str) -> pd.DataFrame:
+    # One row per (month, region, fueltech). Each series in the response
+    # carries its grouping values in `columns` and its points as
+    # [timestamp, value] pairs.
+    rows: list[dict] = []
+    for series in payload.get("data", []):
+        unit = series.get("unit")
+        for result in series.get("results", []):
+            cols = result.get("columns", {})
+            for stamp, value in result.get("data", []):
+                rows.append(
+                    {
+                        "date": stamp,
+                        "REGION": cols.get("region") or cols.get("network_region") or "NEM",
+                        grouping: cols.get(grouping),
+                        "MWh": value,
+                        "unit": unit,
+                    }
+                )
+
+    df = pd.DataFrame(rows, columns=["date", "REGION", grouping, "MWh", "unit"])
+    if df.empty:
+        return df
+
+    df["date"] = pd.to_datetime(df["date"], utc=True).dt.tz_convert(
+        "Australia/Brisbane"
+    ).dt.tz_localize(None)
+    df["yyyymm"] = df["date"].dt.strftime("%Y%m")
+    df["yyyy"] = df["date"].dt.strftime("%Y")
+    df["yyyy_qtr"] = df["date"].dt.to_period("Q").astype(str).str.replace("Q", "_Q")
+    df["MWh"] = pd.to_numeric(df["MWh"], errors="coerce")
+    return df.sort_values(["yyyymm", "REGION", grouping]).reset_index(drop=True)
+
+
 def add_real_values(
     df: pd.DataFrame,
     cpi: pd.DataFrame,
@@ -393,7 +737,8 @@ def add_real_values(
     base = (
         cpi_lookup.loc[cpi_lookup["yyyymm"] == base_yyyymm, "cpi"].iloc[0]
         if base_yyyymm is not None
-        else cpi_lookup["cpi"].iloc[-1]
+        #else cpi_lookup["cpi"].iloc[-1]
+        else cpi_lookup.loc[cpi_lookup.yyyymm == cpi_lookup.yyyymm.max(), "cpi"].iloc[0]
     )
 
     df = df.copy()
@@ -414,7 +759,7 @@ def save_price_and_demand(
     target = out_dir / filename
 
     if target.exists():
-        existing = pd.read_csv(target, parse_dates=["SETTLEMENTDATE"])
+        existing = pd.read_csv(target, parse_dates=["SETTLEMENTDATE", "period_start"])
         combined = pd.concat([existing, df], ignore_index=True)
         combined = combined.drop_duplicates(
             subset=["REGION", "SETTLEMENTDATE"], keep="last"
@@ -428,10 +773,22 @@ def save_price_and_demand(
 
 
 if __name__ == "__main__":
+    output_dir = Path("data_output")
+    output_dir.mkdir(parents=True, exist_ok=True)
     date_start = "202607"
-    date_end = "202607"
+    date_end = "202608"
+    # OpenElectricity generation by fuel. The community plan only serves the
+    # last 730 days, so start at whichever is later: the range asked for above,
+    # or the earliest complete month the plan still covers.
+    gen_start = oe_clamp_start(date_start)
+    grouping_p = "fueltech_group"
+    generation = fetch_generation_by_fueltech(gen_start, date_end, grouping = grouping_p)
+    generation.to_csv(output_dir / f"generation_monthly_{grouping_p}.csv", index=False)
+    grouping_p = "fueltech"
+    generation = fetch_generation_by_fueltech(gen_start, date_end, grouping = grouping_p)
+    generation.to_csv(output_dir / f"generation_monthly_{grouping_p}.csv", index=False)
     Use30min = True
-    fetch_price_and_demand(date_start, date_end)
+    fetch_price_and_demand(date_start, date_end, overwrite=True)
     df1 = load_price_and_demand(date_start, date_end)
     df1.drop(columns = ['PERIODTYPE'], inplace=True)
     df1 = add_period_length(df1)
@@ -439,7 +796,7 @@ if __name__ == "__main__":
     path = save_price_and_demand(df_raw)
     print(f"wrote: {path}")
 
-    df = pd.read_csv(path, parse_dates=["SETTLEMENTDATE"])
+    df = pd.read_csv(path, parse_dates=["SETTLEMENTDATE", "period_start"])
 
     cpi=fetch_cpi("200001")
     df = add_real_values(df, cpi)
@@ -447,17 +804,26 @@ if __name__ == "__main__":
     monthly = group_by_region(df, by=["yyyymm"])
     quarterly = group_by_region(df, by=["yyyy_qtr"])
     period = group_by_region(df, by=["yyyy","time"])
+    # End the windows at the last full month rather than part way through the
+    # current one. AEMO stamps a period with its END, so the 00:00 stamp on the
+    # 1st closes the month before -- the start of the latest month present is
+    # therefore midnight at the end of the last full month, and anchoring there
+    # keeps that month's final day in the window.
+    last_month_end = df["SETTLEMENTDATE"].max().to_period("M").to_timestamp()
+    rolling = rolling_by_region(df, end=last_month_end)
+    print(f"rolling windows end: {(last_month_end - pd.Timedelta(days=1)).date()} 24:00")
     yearly_stats = describe_by(df, "yyyy")
     year_time_stats = describe_by(df, ["yyyy",'time'])
-    output_dir = Path("data_output")
-    output_dir.mkdir(parents=True, exist_ok=True)
+
     yearly.to_csv(output_dir / "yearly.csv", index=False)
     monthly.to_csv(output_dir / "monthly.csv", index=False)
     quarterly.to_csv(output_dir / "quarterly.csv", index=False)
     period.to_csv(output_dir / "period.csv", index=False)
+    rolling.to_csv(output_dir / "rolling.csv", index=False)
     yearly_stats.to_csv(output_dir / "yearly_stats.csv", index=False)
+    
     year_time_stats.to_csv(output_dir / "year_time_stats.csv", index=False)
 
-    plot_prices(yearly[yearly.REGION == "NEM"])
+    #plot_prices(yearly[yearly.REGION == "NEM"])
     print(df.head())
     print(df.dtypes)
